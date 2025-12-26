@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>채팅</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: -apple-system, sans-serif;
+        background: #f0f0f0;
+        height: 100vh;
+      }
+
+      .app {
+        display: flex;
+        height: 100vh;
+      }
+
+      /* 사이드바 */
+      .sidebar {
+        width: 280px;
+        background: white;
+        border-right: 1px solid #ddd;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .sidebar-header {
+        padding: 20px;
+        border-bottom: 1px solid #ddd;
+      }
+
+      .sidebar-header h1 {
+        font-size: 20px;
+        margin-bottom: 15px;
+      }
+
+      .sidebar-header button {
+        width: 100%;
+        padding: 10px;
+        background: #007bff;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+
+      .sidebar-header button:hover {
+        background: #0056b3;
+      }
+
+      /* 채팅방 목록 */
+      .room-list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 10px;
+      }
+
+      .room-item {
+        padding: 15px;
+        margin-bottom: 5px;
+        background: #f9f9f9;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+
+      .room-item:hover {
+        background: #e9e9e9;
+      }
+
+      .room-item.active {
+        background: #007bff;
+        color: white;
+      }
+
+      /* 채팅 영역 */
+      .chat-area {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        background: white;
+      }
+
+      .empty-state {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #999;
+      }
+
+      .chat-header {
+        padding: 20px;
+        border-bottom: 1px solid #ddd;
+        font-weight: bold;
+        font-size: 18px;
+      }
+
+      .messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 20px;
+        background: #fafafa;
+      }
+
+      .message {
+        margin-bottom: 15px;
+      }
+
+      .message-user {
+        font-weight: bold;
+        color: #007bff;
+        margin-bottom: 5px;
+      }
+
+      .message-text {
+        background: white;
+        padding: 10px 15px;
+        border-radius: 8px;
+        display: inline-block;
+      }
+
+      .input-area {
+        padding: 15px;
+        border-top: 1px solid #ddd;
+        display: flex;
+        gap: 10px;
+      }
+
+      .input-area input {
+        flex: 1;
+        padding: 12px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+      }
+
+      .input-area button {
+        padding: 12px 25px;
+        background: #007bff;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+
+      /* 모달 */
+      .modal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.5);
+        align-items: center;
+        justify-content: center;
+      }
+
+      .modal.show {
+        display: flex;
+      }
+
+      .modal-box {
+        background: white;
+        padding: 30px;
+        border-radius: 12px;
+        width: 350px;
+      }
+
+      .modal-box h2 {
+        margin-bottom: 20px;
+      }
+
+      .modal-box input {
+        width: 100%;
+        padding: 12px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        margin-bottom: 20px;
+      }
+
+      .modal-buttons {
+        display: flex;
+        gap: 10px;
+      }
+
+      .modal-buttons button {
+        flex: 1;
+        padding: 10px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+
+      .modal-buttons button:first-child {
+        background: #ddd;
+      }
+
+      .modal-buttons button:last-child {
+        background: #007bff;
+        color: white;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <!-- 사이드바 -->
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <h1>💬 채팅</h1>
+          <button id="btnCreate">+ 방 만들기</button>
+        </div>
+        <div class="room-list" id="roomList"></div>
+      </div>
+
+      <!-- 채팅 영역 -->
+      <div class="chat-area" id="chatArea">
+        <div class="empty-state">채팅방을 선택하세요</div>
+      </div>
+    </div>
+
+    <!-- 모달 -->
+    <div class="modal" id="modal">
+      <div class="modal-box">
+        <h2>새 채팅방</h2>
+        <input type="text" id="roomName" placeholder="방 이름" />
+        <div class="modal-buttons">
+          <button id="btnCancel">취소</button>
+          <button id="btnSubmit">생성</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const API = "http://localhost:8080";
+
+      let rooms = [];
+      let currentRoom = null;
+      let ws = null;
+      const userId = `user_${Math.random().toString(36).substring(2, 9)}`;
+
+      // DOM
+      const roomList = document.getElementById("roomList");
+      const chatArea = document.getElementById("chatArea");
+      const modal = document.getElementById("modal");
+      const roomNameInput = document.getElementById("roomName");
+
+      // 이벤트
+      document.getElementById("btnCreate").onclick = () =>
+        modal.classList.add("show");
+      document.getElementById("btnCancel").onclick = () =>
+        modal.classList.remove("show");
+      document.getElementById("btnSubmit").onclick = createRoom;
+
+      // 채팅방 목록 로드
+      async function loadRooms() {
+        try {
+          const res = await fetch(`${API}/rooms`);
+
+          // 응답 상태 확인
+          if (!res.ok) {
+            console.error(`Error: ${res.status}`);
+            return;
+          }
+
+          rooms = await res.json();
+          console.log("Rooms:", rooms);
+          renderRooms();
+        } catch (e) {
+          console.error("loadRooms error:", e);
+        }
+      }
+
+      // 채팅방 목록 렌더링
+      function renderRooms() {
+        // rooms가 배열인지 확인
+        if (!Array.isArray(rooms)) {
+          console.error("rooms is not an array:", rooms);
+          rooms = [];
+          return;
+        }
+
+        roomList.innerHTML = rooms
+          .map(
+            (room) => `
+      <div class="room-item ${currentRoom?.id === room.id ? "active" : ""}" 
+           onclick="selectRoom('${room.id}')">
+          ${room.name}
+      </div>
+  `
+          )
+          .join("");
+      }
+
+      // 채팅방 생성
+      async function createRoom() {
+        const name = roomNameInput.value.trim();
+        if (!name) return alert("방 이름을 입력하세요");
+
+        try {
+          const res = await fetch(`${API}/rooms`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name }),
+          });
+
+          // 응답 상태 확인
+          if (!res.ok) {
+            const error = await res.json();
+            alert(`Error: ${error.error}`);
+            return;
+          }
+
+          const newRoom = await res.json();
+
+          // rooms가 배열인지 확인
+          if (!Array.isArray(rooms)) {
+            rooms = [];
+          }
+
+          rooms.push(newRoom);
+
+          roomNameInput.value = "";
+          modal.classList.remove("show");
+          renderRooms();
+          selectRoom(newRoom.id);
+        } catch (e) {
+          console.error("createRoom error:", e);
+          alert("방 생성 실패");
+        }
+      }
+
+      // 채팅방 선택
+      async function selectRoom(roomId) {
+        currentRoom = rooms.find((r) => r.id === roomId);
+        if (!currentRoom) {
+          console.error("Room not found:", roomId);
+          return;
+        }
+
+        renderRooms();
+        renderChat();
+        await connectRoom(roomId);
+      }
+
+      // 채팅 영역 렌더링
+      function renderChat() {
+        chatArea.innerHTML = `
+    <div class="chat-header">${currentRoom.name}</div>
+    <div class="messages" id="messages"></div>
+    <div class="input-area">
+        <input type="text" id="msgInput" placeholder="메시지 입력..." 
+               onkeypress="if(event.key==='Enter')sendMessage()">
+        <button onclick="sendMessage()">전송</button>
+    </div>
+  `;
+      }
+
+      async function connectRoom(roomId) {
+        console.log(`🔌 [CONNECT] Connecting to room: ${roomId}`);
+        if (ws) {
+          ws.close();
+          ws = null;
+        }
+
+        ws = new WebSocket(`ws://localhost:8080/ws/${roomId}/${userId}`);
+
+        ws.onopen = () => {
+          console.log(`✅ [CONNECT] WebSocket opened for room: ${roomId}`);
+          const container = document.getElementById("messages");
+          if (container) container.innerHTML = "";
+          // 연결 후 기존 메시지 로드
+          loadMessages();
+        };
+
+        ws.onmessage = (event) => {
+          console.log(`📨 [WS MESSAGE] Received:`, event.data);
+          const data = JSON.parse(event.data);
+          console.log(`📨 [WS MESSAGE] Parsed:`, data);
+          if (data.type === "message") {
+            console.log(
+              `💬 [WS MESSAGE] Adding message from ${data.user}: ${data.message}`
+            );
+            addMessage(data.user, data.message);
+          } else if (data.type === "user_joined") {
+            addSystemMessage(data.message);
+          } else if (data.type === "user_left") {
+            addSystemMessage(data.message);
+          }
+        };
+
+        ws.onerror = (error) => {
+          console.error("WebSocket error:", error);
+        };
+
+        ws.onclose = () => {
+          console.log("WebSocket closed");
+        };
+      }
+
+      // 메시지 로드
+      async function loadMessages() {
+        console.log(`📥 [LOAD] Loading messages for room: ${currentRoom.id}`);
+        try {
+          const res = await fetch(`${API}/rooms/${currentRoom.id}/messages`);
+
+          if (!res.ok) {
+            console.error(`❌ [LOAD] Error: ${res.status}`);
+            return;
+          }
+
+          const messages = await res.json();
+          console.log(
+            `📥 [LOAD] Received ${messages.length} messages:`,
+            messages
+          );
+
+          const container = document.getElementById("messages");
+
+          // messages가 배열인지 확인
+          if (!Array.isArray(messages)) {
+            console.error("❌ [LOAD] messages is not an array:", messages);
+            container.innerHTML = "<p>메시지 로드 실패</p>";
+            return;
+          }
+
+          if (messages.length === 0) {
+            console.log(`ℹ️ [LOAD] No messages to display`);
+            return;
+          }
+
+          console.log(`📥 [LOAD] Rendering ${messages.length} messages`);
+          // 서버에서 최신→오래된 순으로 오므로 reverse
+          messages.reverse();
+          container.innerHTML = messages
+            .map(
+              (msg) => `
+        <div class="message">
+            <div class="message-user">${msg.user}</div>
+            <div class="message-text">${msg.message}</div>
+        </div>
+    `
+            )
+            .join("");
+
+          container.scrollTop = container.scrollHeight;
+          console.log(`✅ [LOAD] Messages rendered successfully`);
+        } catch (e) {
+          console.error("❌ [LOAD] loadMessages error:", e);
+        }
+      }
+
+      function addMessage(user, message) {
+        const container = document.getElementById("messages");
+        if (!container) return;
+        container.insertAdjacentHTML(
+          "beforeend",
+          `
+        <div class="message">
+            <div class="message-user">${user}</div>
+            <div class="message-text">${message}</div>
+        </div>`
+        );
+        container.scrollTop = container.scrollHeight;
+      }
+
+      function addSystemMessage(text) {
+        const container = document.getElementById("messages");
+        if (!container) return;
+        container.insertAdjacentHTML(
+          "beforeend",
+          `
+        <div class="message">
+            <div class="message-user" style="color:#555;">시스템</div>
+            <div class="message-text">${text}</div>
+        </div>`
+        );
+        container.scrollTop = container.scrollHeight;
+      }
+
+      // 메시지 전송
+      async function sendMessage() {
+        const input = document.getElementById("msgInput");
+        const message = input.value.trim();
+        if (!message) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          alert("웹소켓 연결이 없습니다. 방을 다시 선택하세요.");
+          return;
+        }
+
+        console.log(`📤 [SEND] Sending message: ${message}`);
+        ws.send(
+          JSON.stringify({
+            type: "message",
+            message: message,
+          })
+        );
+        console.log(`📤 [SEND] Message sent`);
+
+        input.value = "";
+      }
+
+      loadRooms();
+    </script>
+  </body>
+</html>
