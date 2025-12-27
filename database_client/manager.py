@@ -14,11 +14,18 @@ Consumer Group benefits:
 """
 
 import asyncio
+import time
+from datetime import datetime
 from typing import Optional
 from sqlalchemy import select
 from database_client.initialize import DatabaseClient
 from database_client.models import Room, Message
 from redis_client.initialize import redisClient
+
+
+def log(msg: str, level: str = "INFO"):
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] [{level}] [DBManager] {msg}")
 
 
 class DBManager:
@@ -47,15 +54,48 @@ class DBManager:
         self.poll_interval = poll_interval
         self.running = False
     
+    async def restore_messages_from_db(self, room_id: str, limit: int = 50):
+        """
+        Restore recent messages from DB to Redis Stream.
+        Called on server startup to populate Redis with existing data.
+        """
+        async with self.db.get_session() as session:
+            # Get latest N messages from DB
+            stmt = (
+                select(Message)
+                .where(Message.room_id == room_id)
+                .order_by(Message.created_at.desc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            messages = result.scalars().all()
+            
+            if not messages:
+                log(f"No messages to restore for room {room_id}")
+                return 0
+            
+            # Add messages to Redis in chronological order
+            restored_count = 0
+            for msg in reversed(messages):  # Oldest first
+                try:
+                    await self.redis.XAdd(room_id, [msg.user_id, msg.message])
+                    restored_count += 1
+                except Exception as e:
+                    log(f"Error restoring message {msg.id}: {e}", "WARN")
+            
+            log(f"Restored {restored_count} messages to Redis for room {room_id}")
+            return restored_count
+    
     async def initialize_consumer_groups(self, room_ids: list[str]):
         """
         Create consumer groups for all active rooms.
         Should be called on server startup.
         """
-        print(f"[DBManager] Initializing consumer groups for {len(room_ids)} rooms")
+        log(f"Initializing consumer groups for {len(room_ids)} rooms")
         for room_id in room_ids:
             stream_key = room_id  # Stream key = room_id
             await self.redis.XGroupCreate(stream_key, self.group_name, start_id="$")
+            log(f"Consumer group '{self.group_name}' initialized for room: {room_id}")
     
     async def ensure_room_exists(self, room_id: str, room_name: str = None) -> Room:
         """
@@ -73,7 +113,7 @@ class DBManager:
                 )
                 session.add(room)
                 await session.commit()
-                print(f"[DBManager] Created room: {room_id}")
+                log(f"Created room: {room_id}")
             
             return room
     
@@ -83,47 +123,45 @@ class DBManager:
         
         Args:
             room_id: Room stream key
-            msg_id: Redis message ID (e.g., "1234567890-0")
+            msg_id: Redis message ID (e.g., b"1234567890-0" or "1234567890-0")
             msg_data: Message fields {b'user': b'user1', b'message': b'hello'}
         """
+        start_time = time.time()
         try:
+            # Decode msg_id if it's bytes
+            if isinstance(msg_id, bytes):
+                msg_id = msg_id.decode('utf-8')
+            
             # Decode message data
             user_id = msg_data.get(b'user', b'').decode('utf-8')
             message_text = msg_data.get(b'message', b'').decode('utf-8')
             
             if not user_id or not message_text:
-                print(f"[DBManager] Invalid message format: {msg_data}")
+                log(f"Invalid message format for {msg_id}: {msg_data}", "WARN")
                 await self.redis.XAck(room_id, self.group_name, [msg_id])
                 return
             
-            # Ensure room exists
             await self.ensure_room_exists(room_id)
             
-            # Save to database
             async with self.db.get_session() as session:
-                # Check if message already exists (idempotency)
                 stmt = select(Message).where(Message.redis_msg_id == msg_id)
                 result = await session.execute(stmt)
                 existing = result.scalar_one_or_none()
                 
-                if existing:
-                    print(f"[DBManager] Message {msg_id} already in DB, skipping")
-                else:
-                    new_msg = Message(
-                        room_id=room_id,
-                        user_id=user_id,
-                        message=message_text,
-                        redis_msg_id=msg_id
-                    )
-                    session.add(new_msg)
-                    await session.commit()
-                    print(f"[DBManager] Saved to DB: {room_id} | {user_id}: {message_text[:30]}")
+
+                new_msg = Message(
+                    room_id=room_id,
+                    user_id=user_id,
+                    message=message_text,
+                    redis_msg_id=msg_id
+                )
+                session.add(new_msg)
+                await session.commit()
                 
-                # ACK the message
                 await self.redis.XAck(room_id, self.group_name, [msg_id])
                 
         except Exception as e:
-            print(f"[DBManager] Error processing message {msg_id}: {e}")
+            log(f"Error processing message {msg_id}: {e}", "ERROR")
             # Don't ACK on error - message will be reprocessed
             import traceback
             traceback.print_exc()
@@ -133,8 +171,6 @@ class DBManager:
         Process all pending messages for a single room.
         """
         try:
-            # Read messages from consumer group
-            # ">" means read only new messages not yet delivered to this consumer
             stream_data = await self.redis.XReadGroup(
                 group_name=self.group_name,
                 consumer_name=self.consumer_name,
@@ -145,19 +181,21 @@ class DBManager:
             if not stream_data:
                 return
             
-            # Process each message
             for stream_key, messages in stream_data.items():
-                if isinstance(messages, list):
-                    for msg_id, msg_data in messages:
-                        await self.process_message(room_id, msg_id, msg_data)
+                if isinstance(messages, dict):
+                    msg_count = len(messages)
+                    for msg_id, msg_data in messages.items():
+                        # Convert msg_data from list of tuples to dict
+                        msg_dict = {field: value for field, value in msg_data}
+                        await self.process_message(room_id, msg_id, msg_dict)
             
-            # Trim stream to keep only latest 50 messages
             stream_len = await self.redis.XLen(room_id)
             if stream_len > 50:
+                log(f"Trimming stream {room_id} from {stream_len} to 50 messages")
                 await self.redis.XTrim(room_id, max_len=50)
                 
         except Exception as e:
-            print(f"[DBManager] Error processing room {room_id}: {e}")
+            log(f"Error processing room {room_id}: {e}", "ERROR")
             import traceback
             traceback.print_exc()
     
@@ -172,52 +210,42 @@ class DBManager:
         from sqlalchemy import select
         
         self.running = True
-        print(f"[DBManager] Starting worker: {self.consumer_name}")
         
-        # Start with initial rooms or empty list
         active_rooms = set(initial_room_ids) if initial_room_ids else set()
-        print(f"[DBManager] Monitoring {len(active_rooms)} initial rooms: {list(active_rooms)}")
+        log(f"Monitoring {len(active_rooms)} initial rooms: {list(active_rooms)}")
         
         while self.running:
             try:
-                # ① Discover new rooms from database every poll
                 async with self.db.get_session() as session:
                     stmt = select(Room.room_id)
                     result = await session.execute(stmt)
                     db_rooms = set(row[0] for row in result.all())
                 
-                # ② Add new rooms detected
                 new_rooms = db_rooms - active_rooms
                 if new_rooms:
-                    print(f"[DBManager] Discovered {len(new_rooms)} new rooms: {new_rooms}")
                     await self.initialize_consumer_groups(list(new_rooms))
                     active_rooms.update(new_rooms)
                 
-                # ③ Remove deleted rooms (optional)
                 deleted_rooms = active_rooms - db_rooms
                 if deleted_rooms:
-                    print(f"[DBManager] Removing {len(deleted_rooms)} deleted rooms: {deleted_rooms}")
                     active_rooms -= deleted_rooms
                 
-                # ④ Process each active room's stream
                 for room_id in active_rooms:
                     await self.process_room_stream(room_id)
                 
-                # Wait before next poll
                 await asyncio.sleep(self.poll_interval)
                 
             except asyncio.CancelledError:
-                print(f"[DBManager] Worker cancelled")
+                log("Worker cancelled")
                 self.running = False
                 break
             except Exception as e:
-                print(f"[DBManager] Unexpected error in main loop: {e}")
+                log(f"Unexpected error in main loop: {e}", "ERROR")
                 import traceback
                 traceback.print_exc()
                 await asyncio.sleep(self.poll_interval)
         
-        print(f"[DBManager] Worker stopped")
+        log("Worker stopped")
     
     def stop(self):
-        """Stop the worker loop"""
         self.running = False

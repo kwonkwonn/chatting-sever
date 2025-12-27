@@ -7,7 +7,7 @@ from glide import (
     StreamGroupOptions,
     MaxId, 
     MinId,
-    StreamTrimOptions
+    TrimByMaxLen
 )
 import asyncio
 
@@ -49,7 +49,6 @@ class redisClient():
             ],
         )
         print(f"[XADD] key={key} user={user} msg={msg} -> {data}")
-        #TODO: return 값 규칙 만들기 
         return data
 
     """`
@@ -110,9 +109,7 @@ class redisClient():
     Returns unacknowledged messages for processing.
     """
     async def XReadGroup(self, group_name: str, consumer_name: str, keys_and_ids: dict, count: int = 10):
-        print(f"[XREADGROUP DEBUG] group={group_name}, consumer={consumer_name}, keys_and_ids={keys_and_ids}")
         options = StreamReadGroupOptions(count=count)
-        print(f"[XREADGROUP DEBUG] options={options}")
         data = await self.client.xreadgroup(
             keys_and_ids,
             group_name,    # Second param: group name
@@ -128,7 +125,6 @@ class redisClient():
     """
     async def XAck(self, key: str, group_name: str, msg_ids: list[str]):
         result = await self.client.xack(key, group_name, msg_ids)
-        print(f"[XACK] key={key} group={group_name} ids={msg_ids} -> {result} acked")
         return result
     
     """
@@ -136,9 +132,10 @@ class redisClient():
     Keep only the latest N messages to save memory.
     """
     async def XTrim(self, key: str, max_len: int = 50):
+        from glide import TrimByMaxLen
         result = await self.client.xtrim(
             key,
-            StreamTrimOptions(exact=False, limit=max_len, method="maxlen")
+            TrimByMaxLen(exact=True, threshold=max_len)
         )
         print(f"[XTRIM] key={key} max_len={max_len} -> {result} trimmed")
         return result

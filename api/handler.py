@@ -69,10 +69,29 @@ class API(data_handler):
         return web.Response(text=str(uuid.uuid4()))
 
     async def get_rooms(self, request):
-        #read from database.
-        rooms = self.RoomHandler.get_rooms()
-        to_json = json.dumps(rooms, ensure_ascii=False)
-        return web.Response(text=to_json, content_type='application/json')
+        # Read from database first (persistent), then sync to in-memory RoomHandler
+        if hasattr(self, 'db'):
+            from database_client.models import Room as DBRoom
+            from sqlalchemy import select
+            
+            async with self.db.get_session() as session:
+                stmt = select(DBRoom)
+                db_result = await session.execute(stmt)
+                db_rooms = db_result.scalars().all()
+                
+                # Sync to RoomHandler in-memory cache
+                for db_room in db_rooms:
+                    if db_room.room_id not in self.RoomHandler.rooms:
+                        self.RoomHandler.add_rooms(db_room.room_name, db_room.room_id)
+                
+                # Return DB data
+                rooms = [{"name": r.room_name, "id": r.room_id} for r in db_rooms]
+                return web.json_response(rooms)
+        else:
+            # Fallback to in-memory only
+            rooms = self.RoomHandler.get_rooms()
+            to_json = json.dumps(rooms, ensure_ascii=False)
+            return web.Response(text=to_json, content_type='application/json')
 
     async def post_rooms(self, request):
         data = await request.json()
@@ -91,15 +110,14 @@ class API(data_handler):
                     room = Room(room_id=new_uuid, room_name=name)
                     session.add(room)
                     await session.commit()
-                print(f"[POST_ROOMS] Room {new_uuid} saved to database")
             
-            # Add to DBManager consumer groups if worker is running
             if hasattr(self, 'db_manager'):
                 await self.db_manager.initialize_consumer_groups([new_uuid])
-                print(f"[POST_ROOMS] Consumer group created for {new_uuid}")
+                
+                await self.db_manager.restore_messages_from_db(new_uuid, limit=50)
+                
                 
         except Exception as e:
-            print(f"[POST_ROOMS] error: {e}")
             import traceback
             traceback.print_exc()
             return web.json_response({"error": str(e)}, status=400)
@@ -109,16 +127,48 @@ class API(data_handler):
 
     async def get_messages(self, request):
         room_id = request.match_info.get("room_id")
-        print(f"[GET_MESSAGES] room_id={room_id}")
         try:
-            # XRevRange로 최신 50개 역순 조회 (최신→오래된)
-            raw = await self.DataHandler.XRevRange(room_id, count=50)
-            print(f"[GET_MESSAGES] raw={raw}")
-            result = message.decode_revrange(raw)
-            # 최신→오래된 순 그대로 반환 (프론트에서 reverse)
-            return web.json_response(result)
+            # Try Redis first (fast)
+            stream_len = await self.DataHandler.XLen(room_id)
+            
+            if stream_len > 0:
+                # Redis has data - use it
+                raw = await self.DataHandler.XRevRange(room_id, count=50)
+                result = message.decode_revrange(raw)
+                return web.json_response(result)
+            else:
+                # Redis empty - get from DB
+                if hasattr(self, 'db'):
+                    from database_client.models import Message
+                    from sqlalchemy import select
+                    
+                    async with self.db.get_session() as session:
+                        stmt = (
+                            select(Message)
+                            .where(Message.room_id == room_id)
+                            .order_by(Message.created_at.desc())
+                            .limit(50)
+                        )
+                        db_result = await session.execute(stmt)
+                        messages = db_result.scalars().all()
+                        
+                        # Convert to same format as Redis
+                        result = [
+                            {
+                                "user": msg.user_id,
+                                "message": msg.message,
+                                "timestamp": msg.created_at.isoformat()
+                            }
+                            for msg in messages
+                        ]
+                        print(f"[GET_MESSAGES] Retrieved {len(result)} from DB")
+                        return web.json_response(result)
+                else:
+                    return web.json_response([], status=200)
         except Exception as e:
             print(f"[GET_MESSAGES] error: {e}")
+            import traceback
+            traceback.print_exc()
             return web.json_response([], status=200)
 
     def add_routes(self):
