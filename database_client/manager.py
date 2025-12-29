@@ -34,6 +34,8 @@ class DBManager:
         redis_client: redisClient, 
         db_client: DatabaseClient,
         group_name: str = "db-persist-group",
+        
+        # Unique consumer name picker needs to be implemented for multiple workers.
         consumer_name: str = "db-worker-1",
         poll_interval: float = 1.0,
     ):
